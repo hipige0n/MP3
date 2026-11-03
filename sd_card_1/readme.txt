@@ -5,7 +5,7 @@ pcm5102模块接线：
 Vin --> +5V
 GND --> GND
 LRCK --> PB12
-DIN --> PB13
+DIN --> PB15
 BCK --> PB13
 SCK --> GND
 
