@@ -1,0 +1,9 @@
+*.o
+*.d
+*.axf
+*.map
+*.lnp
+*.dep
+*.build_log.htm
+*.uvguix.*
+*.bak
