@@ -32,6 +32,8 @@ static bool play_requested;
 static char play_path[PATH_CAPACITY];
 static lv_obj_t *browser_screen, *player_screen, *pause_button, *player_status;
 static char play_title[104];
+static lv_obj_t *player_title;
+static int switch_requested;
 static bool player_visible;
 static int displayed_state;
 static void show_player(void);
@@ -331,6 +333,7 @@ static lv_obj_t *make_button(lv_obj_t *parent, int x, int y, int width, int heig
 static void player_back(lv_event_t *event)
 {
     (void)event;
+    switch_requested = 0;
     MP3_Stop();
     player_visible = false;
     lv_screen_load(browser_screen);
@@ -346,12 +349,84 @@ static void player_pause(lv_event_t *event)
     } else if (MP3_State() == 2) {
         /* Paint while DMA is paused, before restarting the audio deadline. */
         lv_label_set_text(lv_obj_get_child(pause_button, 0), "Pause");
-        lv_label_set_text(player_status, "Playing");
+        lv_label_set_text_fmt(player_status, "Playing | Vol %d", MP3_Volume());
         lv_refr_now(NULL);
         MP3_Resume();
     }
 }
-static void unused_control(lv_event_t *event) { (void)event; }
+static void update_player_status(void)
+{
+    int state = MP3_State();
+    lv_label_set_text_fmt(player_status, "%s | Vol %d", state == 1 ? "Playing" :
+        state == 2 ? "Paused" : state == 0 ? "Ended" : "Error; see UART", MP3_Volume());
+}
+static void player_volume(lv_event_t *event)
+{
+    int step = (int)(intptr_t)lv_event_get_user_data(event);
+    MP3_SetVolume(MP3_Volume() + step);
+    update_player_status();
+}
+static void player_switch(lv_event_t *event)
+{
+    if (!switch_requested)
+        switch_requested = (int)(intptr_t)lv_event_get_user_data(event);
+}
+typedef struct { char alias[40], title[104]; } TrackChoice;
+/* Scan on demand, with audio stopped: no fixed playlist limit or font/audio
+ * SD contention during directory reads. Order matches the browser's FAT order. */
+static int adjacent_track(int direction)
+{
+    DIR dir;
+    FILINFO item;
+    TCHAR lfn[256];
+    TrackChoice first={0}, last={0}, previous={0}, chosen={0};
+    bool found=false;
+    FRESULT result=f_opendir(&dir, (const TCHAR[]){'0',':','/',0});
+    if (result != FR_OK) return 0;
+    memset(&item,0,sizeof(item));item.lfname=lfn;item.lfsize=256;
+    for (;;) {
+        lfn[0]=0;
+        result=f_readdir(&dir,&item);
+        if (result != FR_OK || !item.fname[0]) break;
+        if (item.fattrib & (AM_DIR|AM_HID|AM_SYS)) continue;
+        char alias[40], full_name[768];
+        if (!fat_name_utf8(item.fname,alias,sizeof(alias)) || !is_mp3(alias)) continue;
+        TrackChoice track;
+        snprintf(track.alias,sizeof(track.alias),"%s",alias);
+        if (!fat_name_utf8(lfn[0] ? lfn : item.fname,full_name,sizeof(full_name)))
+            snprintf(full_name,sizeof(full_name),"%s",alias);
+        name_preview(track.title,full_name,24);
+        if (!first.alias[0]) first=track;
+        last=track;
+        if (found && direction>0) { chosen=track; break; }
+        if (!strcmp(play_path+3,alias)) {
+            found=true;
+            if (direction<0 && previous.alias[0]) { chosen=previous; break; }
+        }
+        previous=track;
+    }
+    FRESULT closed=f_closedir(&dir);
+    if (result != FR_OK || closed != FR_OK || !first.alias[0]) return 0;
+    if (!chosen.alias[0]) chosen=direction>0 ? first : last;
+    snprintf(play_path,sizeof(play_path),"0:/%s",chosen.alias);
+    snprintf(play_title,sizeof(play_title),"%s",chosen.title);
+    printf("[TRACK SWITCH] direction=%d path=%s\r\n",direction,play_path);
+    return 1;
+}
+static void start_player_track(void)
+{
+    lv_obj_set_style_text_font(player_title,font_for_text(play_title),0);
+    lv_label_set_text(player_title,play_title);
+    lv_obj_remove_state(pause_button,LV_STATE_DISABLED);
+    lv_label_set_text(lv_obj_get_child(pause_button,0),"Pause");
+    lv_label_set_text_fmt(player_status,"Playing | Vol %d",MP3_Volume());
+    /* Draw glyphs and buttons before starting the DMA refill deadline. */
+    lv_refr_now(NULL);
+    MP3_Start(play_path);
+    displayed_state=MP3_State();
+    update_player_status();
+    if (displayed_state<=0) lv_obj_add_state(pause_button,LV_STATE_DISABLED);
+}
 static void show_player(void)
 {
     player_screen = lv_obj_create(NULL);
@@ -359,20 +434,16 @@ static void show_player(void)
     lv_obj_set_style_bg_color(player_screen, lv_color_hex(0x17212b), 0);
     make_button(player_screen, 8, 6, 76, 32, "Back", player_back, NULL);
     lv_obj_t *title = lv_label_create(player_screen);
+    player_title = title;
     lv_obj_set_pos(title, 12, 55);lv_obj_set_size(title, 216, 56);
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_set_style_text_font(title, font_for_text(play_title), 0);
     lv_label_set_text(title, play_title);
     pause_button = make_button(player_screen, 60, 125, 120, 48, "Pause", player_pause, NULL);
-    lv_obj_t *b;
-    b = make_button(player_screen, 8, 190, 106, 36, "Previous", unused_control, NULL);
-    lv_obj_add_state(b, LV_STATE_DISABLED);
-    b = make_button(player_screen, 126, 190, 106, 36, "Next", unused_control, NULL);
-    lv_obj_add_state(b, LV_STATE_DISABLED);
-    b = make_button(player_screen, 8, 239, 106, 36, "Volume -", unused_control, NULL);
-    lv_obj_add_state(b, LV_STATE_DISABLED);
-    b = make_button(player_screen, 126, 239, 106, 36, "Volume +", unused_control, NULL);
-    lv_obj_add_state(b, LV_STATE_DISABLED);
+    make_button(player_screen, 8, 190, 106, 36, "Previous", player_switch, (void *)(intptr_t)-1);
+    make_button(player_screen, 126, 190, 106, 36, "Next", player_switch, (void *)(intptr_t)1);
+    make_button(player_screen, 8, 239, 106, 36, "Volume -", player_volume, (void *)(intptr_t)-5);
+    make_button(player_screen, 126, 239, 106, 36, "Volume +", player_volume, (void *)(intptr_t)5);
     player_status = lv_label_create(player_screen);
     lv_obj_set_pos(player_status, 12, 293);
     lv_obj_set_style_text_color(player_status, lv_color_white(), 0);
@@ -432,15 +503,26 @@ void RootBrowser_Process(void)
     if (play_requested) {
         play_requested = false;
         show_player();
-        MP3_Start(play_path);
+        start_player_track();
         return;
     }
     if (player_visible) {
+        if (switch_requested) {
+            int direction=switch_requested;switch_requested=0;
+            MP3_Stop();
+            if (adjacent_track(direction)) start_player_track();
+            else {
+                displayed_state=0;
+                lv_label_set_text(player_status,"No track / SD read error");
+                lv_obj_add_state(pause_button,LV_STATE_DISABLED);
+            }
+            return;
+        }
         MP3_Process();
         int state = MP3_State();
         if (state != displayed_state) {
             displayed_state = state;
-            lv_label_set_text(player_status, state == 1 ? "Playing" : state == 2 ? "Paused" : state == 0 ? "Playback ended" : "Playback error; see UART");
+            update_player_status();
             lv_label_set_text(lv_obj_get_child(pause_button, 0), state == 2 ? "Play" : "Pause");
             if (state <= 0) lv_obj_add_state(pause_button, LV_STATE_DISABLED);
         }

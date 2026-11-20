@@ -16,6 +16,22 @@ static FIL song;
 static uint8_t input[16384] __attribute__((section(".bss.ccm_audio")));
 static int16_t pcm[2304] __attribute__((section(".bss.ccm_audio")));
 static int16_t output[HALF*2] __attribute__((section(".bss.audio_dma"), aligned(4)));
+/* 50 => old 1/8 amplitude; 100 => capped at 1/2 amplitude. */
+static int volume_level=50;
+static int32_t volume_gain=4096;
+int MP3_Volume(void){return volume_level;}
+void MP3_SetVolume(int volume)
+{
+ if(volume<0)volume=0;
+ if(volume>100)volume=100;
+ volume_level=volume;
+ volume_gain=(32768L*volume*volume)/20000L;
+ printf("[VOLUME] %d/100 gain_q15=%ld\r\n",volume,(long)volume_gain);
+}
+static int16_t scale_sample(int16_t sample)
+{
+ return (int16_t)(((int32_t)sample*volume_gain)/32768L);
+}
 static unsigned used,pos,available;
 static int eof,rate,channels,failed;
 static volatile uint32_t events;
@@ -51,9 +67,9 @@ static unsigned fill(int16_t *dest)
  unsigned written=0;
  while(written<HALF){
   if(pos>=available && !next_frame())break;
-  /* 1/8 digital gain; duplicate mono to both channels. */
-  dest[written++]=pcm[pos*channels]/8;
-  dest[written++]=pcm[pos*channels+(channels==2)]/8;
+  /* Bounded software gain; duplicate mono to both channels. */
+  dest[written++]=scale_sample(pcm[pos*channels]);
+  dest[written++]=scale_sample(pcm[pos*channels+(channels==2)]);
   pos++;
  }
  memset(dest+written,0,(HALF-written)*sizeof(*dest));return written;
@@ -146,7 +162,7 @@ int MP3_Start(const char *path)
  hardware_ready=1;
  if(HAL_I2S_Transmit_DMA(&audio,(uint16_t*)output,HALF*2)!=HAL_OK){play_error("DMA start");return 0;}
  deadline=HAL_GetTick();state=1;
- printf("[PLAY] %s rate=%d channels=%d gain=1/8 slot=32bit\r\n",path,rate,channels);
+ printf("[PLAY] %s rate=%d channels=%d volume=%d/100 slot=32bit\r\n",path,rate,channels,volume_level);
  return 1;
 }
 void MP3_Process(void)

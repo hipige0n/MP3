@@ -7,4 +7,6 @@ void MP3_Stop(void);
 int MP3_State(void);
 int MP3_Pause(void);
 int MP3_Resume(void);
+int MP3_Volume(void);
+void MP3_SetVolume(int volume);
 #endif
