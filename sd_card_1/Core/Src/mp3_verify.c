@@ -10,10 +10,11 @@
 #define HALF 8192U
 static I2S_HandleTypeDef audio;
 static DMA_HandleTypeDef dma;
-static mp3dec_t decoder;
+static mp3dec_t decoder __attribute__((section(".bss.ccm_audio")));
 static FIL song;
-static uint8_t input[16384];
-static int16_t pcm[2304], output[HALF*2];
+static uint8_t input[16384] __attribute__((section(".bss.ccm_audio")));
+static int16_t pcm[2304] __attribute__((section(".bss.ccm_audio")));
+static int16_t output[HALF*2] __attribute__((section(".bss.audio_dma"), aligned(4)));
 static unsigned used,pos,available;
 static int eof,rate,channels,failed;
 static volatile uint32_t events;
@@ -88,13 +89,13 @@ void MP3_Verify(const char *path)
  FRESULT r=f_open(&song,unicode_song,FA_READ);UINT n;DWORD offset=0;
  if(r!=FR_OK){printf("[PLAY FAIL] open=%u\r\n",r);return;}
  used=pos=available=0;eof=rate=channels=failed=0;events=0;dma_error=0;
- if(f_read(&song,input,10,&n)!=FR_OK)goto finish;
+ if(f_read(&song,input,10,&n)!=FR_OK){printf("[PLAY FAIL] header read\r\n");goto finish;}
  if(n==10 && !memcmp(input,"ID3",3)){
-  if((input[6]|input[7]|input[8]|input[9])&128)goto finish;
+  if((input[6]|input[7]|input[8]|input[9])&128){printf("[PLAY FAIL] ID3 size\r\n");goto finish;}
   offset=10U+((DWORD)input[6]<<21)+((DWORD)input[7]<<14)+((DWORD)input[8]<<7)+input[9];
   if(input[3]==4 && (input[5]&16))offset+=10;
  }
- if(offset>f_size(&song)||f_lseek(&song,offset)!=FR_OK)goto finish;
+ if(offset>f_size(&song)||f_lseek(&song,offset)!=FR_OK){printf("[PLAY FAIL] ID3 seek\r\n");goto finish;}
  mp3dec_init(&decoder);
  unsigned counts[2];counts[0]=fill(output);counts[1]=fill(output+HALF);
  if(failed || !counts[0]){printf("[PLAY FAIL] invalid MP3 or unsupported format (44.1/48 kHz only)\r\n");goto finish;}
@@ -122,5 +123,5 @@ cleanup:
  HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);HAL_DMA_DeInit(&dma);HAL_I2S_DeInit(&audio);
 finish:
  (void)f_close(&song);
- printf("Press PA0 after release to replay first MP3.\r\n");
+ printf("[PLAY RETURN] select a root MP3 on the touch screen.\r\n");
 }

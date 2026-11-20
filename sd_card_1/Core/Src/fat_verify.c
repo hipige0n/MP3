@@ -27,6 +27,9 @@ static lv_obj_t *rows[PAGE_SIZE], *names[PAGE_SIZE], *status_label;
 static lv_obj_t *previous_button, *next_button;
 static unsigned page, count, seen;
 static bool pending, scanning, mounted;
+static bool play_requested;
+static char play_path[PATH_CAPACITY];
+void MP3_Verify(const char *path);
 static FRESULT scan_result;
 static uint32_t scan_started;
 static char current_path[PATH_CAPACITY] = "0:/";
@@ -237,7 +240,7 @@ static void update_header(void)
 static void back_clicked(lv_event_t *event)
 {
     (void)event;
-    if (pending || scanning || !mounted || !depth) return;
+    if (pending || scanning || play_requested || !mounted || !depth) return;
     memcpy(requested_path, current_path, parent_length[depth - 1]);
     requested_path[parent_length[depth - 1]] = 0;
     requested_page = parent_page[depth - 1];
@@ -256,7 +259,7 @@ static bool is_mp3(const char *name)
 
 static void page_clicked(lv_event_t *event)
 {
-    if (pending || scanning || !mounted) return;
+    if (pending || scanning || play_requested || !mounted) return;
     requested_page = page;
     if (lv_event_get_user_data(event)) ++requested_page;
     else if (requested_page) --requested_page;
@@ -267,7 +270,7 @@ static void page_clicked(lv_event_t *event)
 
 static void entry_clicked(lv_event_t *event)
 {
-    if (pending || scanning) return;
+    if (pending || scanning || play_requested) return;
     unsigned index = (unsigned)(uintptr_t)lv_event_get_user_data(event);
     if (index >= count) return;
     RootEntry *entry = &entries[index];
@@ -293,6 +296,15 @@ static void entry_clicked(lv_event_t *event)
         lv_obj_set_style_text_font(status_label, font_for_text(entry->display_name), 0);
         lv_label_set_text_fmt(status_label, "%s / %lu B", entry->display_name, (unsigned long)entry->size);
         printf("[FILE SELECT] %s size=%lu\r\n", path, (unsigned long)entry->size);
+        if (depth != 0) {
+            lv_obj_set_style_text_font(status_label, LV_FONT_DEFAULT, 0);
+            lv_label_set_text(status_label, "Test: root MP3 files only");
+            return;
+        }
+        snprintf(play_path, sizeof(play_path), "%s", path);
+        play_requested = true;
+        lv_obj_set_style_text_font(status_label, LV_FONT_DEFAULT, 0);
+        lv_label_set_text(status_label, "Playing selected MP3...");
     }
 }
 
@@ -355,6 +367,16 @@ void FAT_Verify(void)
 void RootBrowser_Process(void)
 {
     if (!mounted) return;
+    if (play_requested) {
+        play_requested = false;
+        /* Flush the playing status before audio starts. Font I/O and LCD
+         * refresh remain outside the DMA audio loop in this first test.
+         */
+        lv_refr_now(NULL);
+        MP3_Verify(play_path);
+        lv_label_set_text(status_label, "Playback ended; select a track");
+        return;
+    }
     if (pending) {
         pending = false;
         font_hits = font_misses = 0;

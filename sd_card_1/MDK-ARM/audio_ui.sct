@@ -1,0 +1,16 @@
+LR_IROM1 0x08000000 0x00100000 {
+  ER_IROM1 0x08000000 0x00100000 {
+    *.o (RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+    .ANY (+XO)
+  }
+  RW_CCM 0x10000000 0x00010000 {
+    startup_stm32f407xx.o (STACK)
+    mp3_verify.o (.bss.ccm_audio)
+  }
+  RW_SRAM 0x20000000 0x00020000 {
+    mp3_verify.o (.bss.audio_dma)
+    .ANY (+RW +ZI)
+  }
+}
