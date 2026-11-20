@@ -2,6 +2,7 @@
 #include "lvgl.h"
 #include "ff.h"
 #include "fat_utf8.h"
+#include "main.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -27,6 +28,7 @@ static lv_obj_t *previous_button, *next_button;
 static unsigned page, count, seen;
 static bool pending, scanning, mounted;
 static FRESULT scan_result;
+static uint32_t scan_started;
 static char current_path[PATH_CAPACITY] = "0:/";
 static char requested_path[PATH_CAPACITY] = "0:/";
 static unsigned parent_length[MAX_DEPTH], parent_page[MAX_DEPTH];
@@ -118,9 +120,9 @@ static void load_browser_font(lv_obj_t *screen)
     driver.seek_cb = font_seek;
     driver.tell_cb = font_tell;
     lv_fs_drv_register(&driver);
-    browser_font = lv_tiny_ttf_create_file_ex("S:/FONTJP.TTC", 16, LV_FONT_KERNING_NONE, 32);
+    browser_font = lv_tiny_ttf_create_file_ex("S:/FONTJP.TTC", 16, LV_FONT_KERNING_NONE, 16);
     printf("[FONT INIT] JP_done=%u; loading CN\r\n", browser_font != NULL);
-    lv_font_t *chinese = lv_tiny_ttf_create_file_ex("S:/FONTCN.TTC", 16, LV_FONT_KERNING_NONE, 32);
+    lv_font_t *chinese = lv_tiny_ttf_create_file_ex("S:/FONTCN.TTC", 16, LV_FONT_KERNING_NONE, 16);
     printf("[FONT INIT] CN_done=%u\r\n", chinese != NULL);
     if (browser_font) {
         browser_font->fallback = chinese ? chinese : LV_FONT_DEFAULT;
@@ -156,10 +158,28 @@ static const lv_font_t *font_for_text(const char *text)
     return LV_FONT_DEFAULT;
 }
 
+/* Limit preview text before LVGL measures it. Full names remain in entries. */
+static void name_preview(char *destination, const char *source, unsigned limit)
+{
+    unsigned characters = 0;
+    size_t length = 0;
+    while (source[length] && characters < limit) {
+        ++length;
+        while (((unsigned char)source[length] & 0xC0U) == 0x80U) ++length;
+        ++characters;
+    }
+    memcpy(destination, source, length);
+    if (source[length]) {
+        memcpy(destination + length, "...", 4);
+    } else destination[length] = 0;
+}
+
 static void update_header(void)
 {
     lv_obj_set_style_text_font(path_label, font_for_text(current_title), 0);
-    lv_label_set_text(path_label, current_title);
+    char preview[56];
+    name_preview(preview, current_title, 12);
+    lv_label_set_text(path_label, preview);
     if (depth && !scanning) lv_obj_remove_state(back_button, LV_STATE_DISABLED);
     else lv_obj_add_state(back_button, LV_STATE_DISABLED);
 }
@@ -287,6 +307,7 @@ void RootBrowser_Process(void)
     if (!mounted) return;
     if (pending) {
         pending = false;
+        scan_started = HAL_GetTick();
         scan_result = fat_path_utf16(requested_path, unicode_path, 512)
                       ? f_opendir(&directory, unicode_path) : FR_INVALID_NAME;
         if (scan_result != FR_OK) {
@@ -307,10 +328,8 @@ void RootBrowser_Process(void)
         page = requested_page;
         count = seen = 0;
         scanning = true;
-        update_header();
         lv_obj_add_state(previous_button, LV_STATE_DISABLED);
         lv_obj_add_state(next_button, LV_STATE_DISABLED);
-        for (unsigned i = 0; i < PAGE_SIZE; ++i) lv_obj_add_flag(rows[i], LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_text_font(status_label, LV_FONT_DEFAULT, 0);
         lv_label_set_text(status_label, "Reading folder...");
         memset(&info, 0, sizeof(info));
@@ -320,7 +339,7 @@ void RootBrowser_Process(void)
     }
     if (!scanning) return;
     bool complete = false;
-    for (unsigned budget = 0; budget < 8; ++budget) {
+    for (unsigned budget = 0; budget < 32; ++budget) {
         long_name[0] = 0;
         scan_result = f_readdir(&directory, &info);
         if (scan_result != FR_OK || !info.fname[0]) { complete = true; break; }
@@ -342,17 +361,23 @@ void RootBrowser_Process(void)
     if (!complete) return;
     FRESULT close_result = f_closedir(&directory);
     scanning = false;
-    update_header();
+    uint32_t scan_ms = HAL_GetTick() - scan_started;
     if (scan_result == FR_OK) scan_result = close_result;
     if (scan_result != FR_OK) {
         lv_label_set_text_fmt(status_label, "Read failed: %u", scan_result);
         return;
     }
+    uint32_t prepare_started = HAL_GetTick();
+    update_header();
     for (unsigned i = 0; i < count; ++i) {
+        char preview[104];
+        name_preview(preview, entries[i].display_name, 24);
         lv_obj_set_style_text_font(names[i], font_for_text(entries[i].display_name), 0);
-        lv_label_set_text_fmt(names[i], "%s %s", entries[i].folder ? "[DIR]" : "[MP3]", entries[i].display_name);
+        lv_label_set_text_fmt(names[i], "%s %s", entries[i].folder ? "[DIR]" : "[MP3]", preview);
         lv_obj_remove_flag(rows[i], LV_OBJ_FLAG_HIDDEN);
     }
+    for (unsigned i = count; i < PAGE_SIZE; ++i) lv_obj_add_flag(rows[i], LV_OBJ_FLAG_HIDDEN);
+    printf("[BROWSER PERF] scan_ms=%lu prepare_ms=%lu\r\n", (unsigned long)scan_ms, (unsigned long)(HAL_GetTick() - prepare_started));
     if (page) lv_obj_remove_state(previous_button, LV_STATE_DISABLED);
     if (seen > (page + 1) * PAGE_SIZE) lv_obj_remove_state(next_button, LV_STATE_DISABLED);
     if (!browser_font) lv_label_set_text(status_label, "Missing SD fonts; check serial");

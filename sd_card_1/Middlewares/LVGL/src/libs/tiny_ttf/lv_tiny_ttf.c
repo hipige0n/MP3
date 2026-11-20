@@ -346,7 +346,7 @@ static void ttf_release_glyph_cb(const lv_font_t * font, lv_font_glyph_dsc_t * g
 static void lv_tiny_ttf_cache_create(ttf_font_desc_t * dsc)
 {
     /*Init cache*/
-    dsc->glyph_cache = lv_cache_create(&lv_cache_class_lru_rb_count, sizeof(tiny_ttf_glyph_cache_data_t), dsc->cache_size,
+    dsc->glyph_cache = lv_cache_create(&lv_cache_class_lru_rb_count, sizeof(tiny_ttf_glyph_cache_data_t), dsc->cache_size ? 128U : 0U,
     (lv_cache_ops_t) {
         .compare_cb = (lv_cache_compare_cb_t)tiny_ttf_glyph_cache_compare_cb,
         .create_cb = (lv_cache_create_cb_t)tiny_ttf_glyph_cache_create_cb,
