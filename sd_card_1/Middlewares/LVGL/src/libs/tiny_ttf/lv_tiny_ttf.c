@@ -227,6 +227,9 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
         return true;
     }
 
+    /* ASCII glyphs are supplied by the built-in fallback font in Flash. */
+    if (unicode_letter >= 0x20 && unicode_letter < 0x7F) return false;
+
     ttf_font_desc_t * dsc = (ttf_font_desc_t *)font->dsc;
 
     tiny_ttf_glyph_cache_data_t search_key = {

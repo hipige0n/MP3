@@ -55,6 +55,19 @@ static lv_obj_t *back_button, *path_label;
 /* LVGL font-only read-only filesystem. File data remains on the SD card. */
 static FIL font_files[2];
 static bool font_used[2];
+typedef struct {
+    uint32_t block, age;
+    uint16_t valid_bytes;
+    bool valid;
+    uint8_t data[512];
+} FontBlock;
+static FontBlock font_blocks[2][3];
+static uint32_t font_position[2], font_age;
+static uint32_t font_hits, font_misses;
+static unsigned font_index(void *file)
+{
+    return file == &font_files[1] ? 1U : 0U;
+}
 static lv_font_t *browser_font;
 static void *font_open(lv_fs_drv_t *driver, const char *path, lv_fs_mode_t mode)
 {
@@ -74,6 +87,8 @@ static void *font_open(lv_fs_drv_t *driver, const char *path, lv_fs_mode_t mode)
     if (result != FR_OK) return NULL;
     printf("[FONT SIZE] %s bytes=%lu\r\n", path, (unsigned long)f_size(&font_files[index]));
     font_used[index] = true;
+    font_position[index] = 0;
+    memset(font_blocks[index], 0, sizeof(font_blocks[index]));
     return &font_files[index];
 }
 static lv_fs_res_t font_close(lv_fs_drv_t *driver, void *file)
@@ -86,25 +101,59 @@ static lv_fs_res_t font_close(lv_fs_drv_t *driver, void *file)
 static lv_fs_res_t font_read(lv_fs_drv_t *driver, void *file, void *buffer, uint32_t size, uint32_t *read)
 {
     (void)driver;
-    UINT actual = 0;
-    FRESULT result = f_read(file, buffer, size, &actual);
-    *read = actual;
-    return result == FR_OK ? LV_FS_RES_OK : LV_FS_RES_FS_ERR;
+    unsigned index = font_index(file);
+    FIL *stream = file;
+    uint8_t *dest = buffer;
+    *read = 0;
+    while (size && font_position[index] < f_size(stream)) {
+        uint32_t block = font_position[index] / 512U;
+        FontBlock *cached = NULL;
+        for (unsigned i = 0; i < 3; ++i)
+            if (font_blocks[index][i].valid && font_blocks[index][i].block == block)
+                cached = &font_blocks[index][i];
+        if (!cached) {
+            cached = &font_blocks[index][0];
+            for (unsigned i = 0; i < 3; ++i) {
+                if (!font_blocks[index][i].valid) { cached = &font_blocks[index][i]; break; }
+                if (font_blocks[index][i].age < cached->age) cached = &font_blocks[index][i];
+            }
+            UINT actual = 0;
+            cached->valid = false;
+            if (f_lseek(stream, block * 512U) != FR_OK ||
+                f_read(stream, cached->data, 512, &actual) != FR_OK) return LV_FS_RES_FS_ERR;
+            cached->block = block;
+            cached->valid_bytes = actual;
+            cached->valid = true;
+            ++font_misses;
+        } else ++font_hits;
+        cached->age = ++font_age;
+        unsigned offset = font_position[index] % 512U;
+        if (offset >= cached->valid_bytes) return LV_FS_RES_FS_ERR;
+        uint32_t bytes = cached->valid_bytes - offset;
+        if (bytes > size) bytes = size;
+        memcpy(dest, cached->data + offset, bytes);
+        font_position[index] += bytes;
+        *read += bytes;
+        dest += bytes;
+        size -= bytes;
+    }
+    return LV_FS_RES_OK;
 }
 static lv_fs_res_t font_seek(lv_fs_drv_t *driver, void *file, uint32_t offset, lv_fs_whence_t origin)
 {
     (void)driver;
     FIL *stream = file;
     uint64_t position = offset;
-    if (origin == LV_FS_SEEK_CUR) position += f_tell(stream);
+    if (origin == LV_FS_SEEK_CUR) position += font_position[font_index(file)];
     else if (origin == LV_FS_SEEK_END) position += f_size(stream);
     if (position > f_size(stream)) return LV_FS_RES_INV_PARAM;
-    return f_lseek(stream, (DWORD)position) == FR_OK ? LV_FS_RES_OK : LV_FS_RES_FS_ERR;
+    font_position[font_index(file)] = (uint32_t)position;
+    return LV_FS_RES_OK;
 }
 static lv_fs_res_t font_tell(lv_fs_drv_t *driver, void *file, uint32_t *position)
 {
     (void)driver;
-    *position = f_tell((FIL *)file);
+    *position = font_position[font_index(file)];
     return LV_FS_RES_OK;
 }
 static void load_browser_font(lv_obj_t *screen)
@@ -113,7 +162,7 @@ static void load_browser_font(lv_obj_t *screen)
     static lv_fs_drv_t driver;
     lv_fs_drv_init(&driver);
     driver.letter = 'S';
-    driver.cache_size = 2048;
+    driver.cache_size = 0; /* Three independent sector slots per font replace one sliding window. */
     driver.open_cb = font_open;
     driver.close_cb = font_close;
     driver.read_cb = font_read;
@@ -124,6 +173,7 @@ static void load_browser_font(lv_obj_t *screen)
     printf("[FONT INIT] JP_done=%u; loading CN\r\n", browser_font != NULL);
     lv_font_t *chinese = lv_tiny_ttf_create_file_ex("S:/FONTCN.TTC", 16, LV_FONT_KERNING_NONE, 16);
     printf("[FONT INIT] CN_done=%u\r\n", chinese != NULL);
+    if (chinese) chinese->fallback = LV_FONT_DEFAULT;
     if (browser_font) {
         browser_font->fallback = chinese ? chinese : LV_FONT_DEFAULT;
     } else browser_font = chinese;
@@ -307,6 +357,7 @@ void RootBrowser_Process(void)
     if (!mounted) return;
     if (pending) {
         pending = false;
+        font_hits = font_misses = 0;
         scan_started = HAL_GetTick();
         scan_result = fat_path_utf16(requested_path, unicode_path, 512)
                       ? f_opendir(&directory, unicode_path) : FR_INVALID_NAME;
@@ -377,7 +428,7 @@ void RootBrowser_Process(void)
         lv_obj_remove_flag(rows[i], LV_OBJ_FLAG_HIDDEN);
     }
     for (unsigned i = count; i < PAGE_SIZE; ++i) lv_obj_add_flag(rows[i], LV_OBJ_FLAG_HIDDEN);
-    printf("[BROWSER PERF] scan_ms=%lu prepare_ms=%lu\r\n", (unsigned long)scan_ms, (unsigned long)(HAL_GetTick() - prepare_started));
+    printf("[BROWSER PERF] scan_ms=%lu prepare_ms=%lu font_hits=%lu font_reads=%lu\r\n", (unsigned long)scan_ms, (unsigned long)(HAL_GetTick() - prepare_started), (unsigned long)font_hits, (unsigned long)font_misses);
     if (page) lv_obj_remove_state(previous_button, LV_STATE_DISABLED);
     if (seen > (page + 1) * PAGE_SIZE) lv_obj_remove_state(next_button, LV_STATE_DISABLED);
     if (!browser_font) lv_label_set_text(status_label, "Missing SD fonts; check serial");
