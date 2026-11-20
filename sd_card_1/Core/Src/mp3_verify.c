@@ -5,6 +5,7 @@
 #include "ff.h"
 #include "fat_utf8.h"
 #include "main.h"
+#include "mp3_player.h"
 #include <stdio.h>
 #include <string.h>
 #define HALF 8192U
@@ -82,46 +83,88 @@ static int hardware_init(void)
  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn,1,0);HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
  return 1;
 }
-void MP3_Verify(const char *path)
+static unsigned counts[2];
+static uint32_t served, deadline;
+static int state, file_open, hardware_ready;
+int MP3_State(void) { return state; }
+void MP3_Stop(void)
+{
+ if(hardware_ready){
+  HAL_I2S_DMAStop(&audio);
+  HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);
+  HAL_DMA_DeInit(&dma);HAL_I2S_DeInit(&audio);
+  hardware_ready=0;
+ }
+ if(file_open){(void)f_close(&song);file_open=0;}
+ state=0;
+}
+static void play_error(const char *reason)
+{
+ printf("[PLAY FAIL] %s\r\n",reason);MP3_Stop();state=-1;
+}
+int MP3_Pause(void)
+{
+ if(state!=1)return 0;
+ /* Freeze the DMA read position; buffers and decoder remain intact. */
+ if(HAL_I2S_DMAPause(&audio)!=HAL_OK){play_error("pause");return 0;}
+ __HAL_I2S_DISABLE(&audio);
+ state=2;printf("[PLAY PAUSE]\r\n");return 1;
+}
+int MP3_Resume(void)
+{
+ if(state!=2)return 0;
+ deadline=HAL_GetTick();
+ if(HAL_I2S_DMAResume(&audio)!=HAL_OK){play_error("resume");return 0;}
+ __HAL_I2S_ENABLE(&audio);
+ state=1;printf("[PLAY RESUME]\r\n");return 1;
+}
+int MP3_Start(const char *path)
 {
  static TCHAR unicode_song[512];
- if(!fat_path_utf16(path,unicode_song,512))return;
+ MP3_Stop();
+ if(!fat_path_utf16(path,unicode_song,512)){play_error("path");return 0;}
  FRESULT r=f_open(&song,unicode_song,FA_READ);UINT n;DWORD offset=0;
- if(r!=FR_OK){printf("[PLAY FAIL] open=%u\r\n",r);return;}
- used=pos=available=0;eof=rate=channels=failed=0;events=0;dma_error=0;
- if(f_read(&song,input,10,&n)!=FR_OK){printf("[PLAY FAIL] header read\r\n");goto finish;}
+ if(r!=FR_OK){play_error("open");return 0;}
+ file_open=1;
+ used=pos=available=0;eof=rate=channels=failed=0;events=0;dma_error=0;served=0;
+ if(f_read(&song,input,10,&n)!=FR_OK){play_error("header read");return 0;}
  if(n==10 && !memcmp(input,"ID3",3)){
-  if((input[6]|input[7]|input[8]|input[9])&128){printf("[PLAY FAIL] ID3 size\r\n");goto finish;}
+  if((input[6]|input[7]|input[8]|input[9])&128){play_error("ID3 size");return 0;}
   offset=10U+((DWORD)input[6]<<21)+((DWORD)input[7]<<14)+((DWORD)input[8]<<7)+input[9];
   if(input[3]==4 && (input[5]&16))offset+=10;
  }
- if(offset>f_size(&song)||f_lseek(&song,offset)!=FR_OK){printf("[PLAY FAIL] ID3 seek\r\n");goto finish;}
+ if(offset>f_size(&song)||f_lseek(&song,offset)!=FR_OK){play_error("ID3 seek");return 0;}
  mp3dec_init(&decoder);
- unsigned counts[2];counts[0]=fill(output);counts[1]=fill(output+HALF);
- if(failed || !counts[0]){printf("[PLAY FAIL] invalid MP3 or unsupported format (44.1/48 kHz only)\r\n");goto finish;}
- if(!hardware_init()){printf("[PLAY FAIL] I2S/DMA init\r\n");goto finish;}
- printf("[PLAY] %s rate=%d channels=%d gain=1/8 slot=32bit BCK=64fs PB13=BCK PB12=LRCK PB15=DIN\r\n",path,rate,channels);
- if(HAL_I2S_Transmit_DMA(&audio,(uint16_t*)output,HALF*2)!=HAL_OK){printf("[PLAY FAIL] DMA start\r\n");goto cleanup;}
- printf("[DMA START] I2SCFGR=%08lX I2SPR=%08lX DMA_CR=%08lX NDTR=%lu\r\n",(unsigned long)SPI2->I2SCFGR,(unsigned long)SPI2->I2SPR,(unsigned long)DMA1_Stream4->CR,(unsigned long)DMA1_Stream4->NDTR);
- uint32_t served=0,deadline=HAL_GetTick();
- for(;;){
-  if(dma_error){printf("[PLAY FAIL] DMA/I2S error\r\n");break;}
-  uint32_t current=events;
-  if(current==served){if(HAL_GetTick()-deadline>1000){printf("[PLAY FAIL] DMA timeout\r\n");break;}HAL_Delay(1);continue;}
-  if(current-served!=1){printf("[PLAY FAIL] buffer underrun\r\n");break;}
-  unsigned half=served&1U;
-  /* An empty half has just completed: all previous audio has drained. */
-  if(!counts[half]){printf("[PLAY DONE] EOF\r\n");break;}
-  counts[half]=fill(output+half*HALF);
-  if(failed){printf("[PLAY FAIL] SD read or midstream format change\r\n");break;}
-  if(events!=current){printf("[PLAY FAIL] buffer refill missed deadline\r\n");break;}
-  served=current;deadline=HAL_GetTick();
-  if(served==1 || served%64U==0) printf("[DMA RUN] halves=%lu NDTR=%lu PCM_sample=%d\r\n",(unsigned long)served,(unsigned long)DMA1_Stream4->NDTR,output[half*HALF]);
+ counts[0]=fill(output);counts[1]=fill(output+HALF);
+ if(failed || !counts[0]){play_error("invalid MP3 (44.1/48 kHz only)");return 0;}
+ if(!hardware_init()){
+  HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);
+  if(dma.Instance)HAL_DMA_DeInit(&dma);
+  if(audio.Instance)HAL_I2S_DeInit(&audio);
+  play_error("I2S/DMA init");return 0;
  }
- HAL_I2S_DMAStop(&audio);
-cleanup:
- HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);HAL_DMA_DeInit(&dma);HAL_I2S_DeInit(&audio);
-finish:
- (void)f_close(&song);
- printf("[PLAY RETURN] select a root MP3 on the touch screen.\r\n");
+ hardware_ready=1;
+ if(HAL_I2S_Transmit_DMA(&audio,(uint16_t*)output,HALF*2)!=HAL_OK){play_error("DMA start");return 0;}
+ deadline=HAL_GetTick();state=1;
+ printf("[PLAY] %s rate=%d channels=%d gain=1/8 slot=32bit\r\n",path,rate,channels);
+ return 1;
+}
+void MP3_Process(void)
+{
+ if(state!=1)return;
+ if(dma_error){play_error("DMA/I2S error");return;}
+ uint32_t current=events;
+ if(current==served){
+  if(HAL_GetTick()-deadline>1000)play_error("DMA timeout");
+  return;
+ }
+ if(current-served!=1){play_error("buffer underrun");return;}
+ unsigned half=served&1U;
+ if(!counts[half]){printf("[PLAY DONE] EOF\r\n");MP3_Stop();return;}
+ counts[half]=fill(output+half*HALF);
+ if(failed){play_error("SD read or format change");return;}
+ if(events!=current){play_error("buffer refill missed deadline");return;}
+ served=current;deadline=HAL_GetTick();
+ if(served==1 || served%64U==0)
+  printf("[DMA RUN] halves=%lu\r\n",(unsigned long)served);
 }

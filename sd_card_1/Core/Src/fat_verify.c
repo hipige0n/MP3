@@ -3,6 +3,7 @@
 #include "ff.h"
 #include "fat_utf8.h"
 #include "main.h"
+#include "mp3_player.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -29,7 +30,11 @@ static unsigned page, count, seen;
 static bool pending, scanning, mounted;
 static bool play_requested;
 static char play_path[PATH_CAPACITY];
-void MP3_Verify(const char *path);
+static lv_obj_t *browser_screen, *player_screen, *pause_button, *player_status;
+static char play_title[104];
+static bool player_visible;
+static int displayed_state;
+static void show_player(void);
 static FRESULT scan_result;
 static uint32_t scan_started;
 static char current_path[PATH_CAPACITY] = "0:/";
@@ -302,6 +307,7 @@ static void entry_clicked(lv_event_t *event)
             return;
         }
         snprintf(play_path, sizeof(play_path), "%s", path);
+        name_preview(play_title, entry->display_name, 24);
         play_requested = true;
         lv_obj_set_style_text_font(status_label, LV_FONT_DEFAULT, 0);
         lv_label_set_text(status_label, "Playing selected MP3...");
@@ -322,9 +328,65 @@ static lv_obj_t *make_button(lv_obj_t *parent, int x, int y, int width, int heig
     return button;
 }
 
+static void player_back(lv_event_t *event)
+{
+    (void)event;
+    MP3_Stop();
+    player_visible = false;
+    lv_screen_load(browser_screen);
+    lv_obj_delete(player_screen);
+    player_screen = NULL;
+    lv_label_set_text(status_label, "Select a root MP3");
+}
+static void player_pause(lv_event_t *event)
+{
+    (void)event;
+    if (MP3_State() == 1) {
+        MP3_Pause();
+    } else if (MP3_State() == 2) {
+        /* Paint while DMA is paused, before restarting the audio deadline. */
+        lv_label_set_text(lv_obj_get_child(pause_button, 0), "Pause");
+        lv_label_set_text(player_status, "Playing");
+        lv_refr_now(NULL);
+        MP3_Resume();
+    }
+}
+static void unused_control(lv_event_t *event) { (void)event; }
+static void show_player(void)
+{
+    player_screen = lv_obj_create(NULL);
+    lv_obj_remove_flag(player_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(player_screen, lv_color_hex(0x17212b), 0);
+    make_button(player_screen, 8, 6, 76, 32, "Back", player_back, NULL);
+    lv_obj_t *title = lv_label_create(player_screen);
+    lv_obj_set_pos(title, 12, 55);lv_obj_set_size(title, 216, 56);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, font_for_text(play_title), 0);
+    lv_label_set_text(title, play_title);
+    pause_button = make_button(player_screen, 60, 125, 120, 48, "Pause", player_pause, NULL);
+    lv_obj_t *b;
+    b = make_button(player_screen, 8, 190, 106, 36, "Previous", unused_control, NULL);
+    lv_obj_add_state(b, LV_STATE_DISABLED);
+    b = make_button(player_screen, 126, 190, 106, 36, "Next", unused_control, NULL);
+    lv_obj_add_state(b, LV_STATE_DISABLED);
+    b = make_button(player_screen, 8, 239, 106, 36, "Volume -", unused_control, NULL);
+    lv_obj_add_state(b, LV_STATE_DISABLED);
+    b = make_button(player_screen, 126, 239, 106, 36, "Volume +", unused_control, NULL);
+    lv_obj_add_state(b, LV_STATE_DISABLED);
+    player_status = lv_label_create(player_screen);
+    lv_obj_set_pos(player_status, 12, 293);
+    lv_obj_set_style_text_color(player_status, lv_color_white(), 0);
+    lv_label_set_text(player_status, "Playing");
+    player_visible = true;displayed_state = 1;
+    lv_screen_load(player_screen);
+    /* Render the entire page and load title glyphs before starting DMA. */
+    lv_refr_now(NULL);
+}
+
 void FAT_Verify(void)
 {
     lv_obj_t *screen = lv_obj_create(NULL);
+    browser_screen = screen;
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x17212b), 0);
     back_button = make_button(screen, 8, 3, 65, 28, "Back", back_clicked, NULL);
@@ -369,12 +431,19 @@ void RootBrowser_Process(void)
     if (!mounted) return;
     if (play_requested) {
         play_requested = false;
-        /* Flush the playing status before audio starts. Font I/O and LCD
-         * refresh remain outside the DMA audio loop in this first test.
-         */
-        lv_refr_now(NULL);
-        MP3_Verify(play_path);
-        lv_label_set_text(status_label, "Playback ended; select a track");
+        show_player();
+        MP3_Start(play_path);
+        return;
+    }
+    if (player_visible) {
+        MP3_Process();
+        int state = MP3_State();
+        if (state != displayed_state) {
+            displayed_state = state;
+            lv_label_set_text(player_status, state == 1 ? "Playing" : state == 2 ? "Paused" : state == 0 ? "Playback ended" : "Playback error; see UART");
+            lv_label_set_text(lv_obj_get_child(pause_button, 0), state == 2 ? "Play" : "Pause");
+            if (state <= 0) lv_obj_add_state(pause_button, LV_STATE_DISABLED);
+        }
         return;
     }
     if (pending) {
