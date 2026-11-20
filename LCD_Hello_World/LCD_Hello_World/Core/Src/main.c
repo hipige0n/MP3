@@ -3,6 +3,8 @@
  * No audio/SD/TP/UART/DMA. Bare-panel power/backlight require external wiring.
  */
 #include "main.h"
+#include "lvgl.h"
+#include "ui.h"
 void SystemClock_Config(void);
 #define SCK GPIO_PIN_7
 #define MOSI GPIO_PIN_8
@@ -23,10 +25,156 @@ static void window(unsigned x0,unsigned y0,unsigned x1,unsigned y1){
  cmd(0x2a);data(x0>>8);data(x0);data(x1>>8);data(x1);
  cmd(0x2b);data(y0>>8);data(y0);data(y1>>8);data(y1);cmd(0x2c);
 }
-static void clear(void){
- window(0,0,239,319);pin(CS,0);pin(DC,1);
- for(unsigned i=0;i<240U*320U;i++){byte(0xFF);byte(0xFF);}pin(CS,1);
+/* RGB565 draw buffer for ten rows. The panel receives the high byte first. */
+static __ALIGNED(4) uint16_t lcd_buffer[240U * 10U];
+
+static void lcd_flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
+{
+    const uint16_t *rgb565 = (const uint16_t *)pixels;
+    uint32_t count = (uint32_t)lv_area_get_width(area) * lv_area_get_height(area);
+    window(area->x1, area->y1, area->x2, area->y2);
+    pin(CS, 0);
+    pin(DC, 1);
+    for (uint32_t i = 0; i < count; ++i) {
+        byte((uint8_t)(rgb565[i] >> 8));
+        byte((uint8_t)rgb565[i]);
+    }
+    pin(CS, 1);
+    lv_display_flush_ready(display);
 }
+
+/* FT6336U: PB6=SCL, PB7=SDA, PE12=RESET. Poll first touch point. */
+#define TP_SCL GPIO_PIN_6
+#define TP_SDA GPIO_PIN_7
+#define TP_RST GPIO_PIN_12
+#define TP_ADDRESS 0x38U
+
+static void tp_line(uint16_t line, bool high)
+{
+    GPIOB->BSRR = high ? line : ((uint32_t)line << 16);
+}
+static void tp_delay(void)
+{
+    for (volatile unsigned i = 0; i < 100; ++i) __NOP();
+}
+static bool tp_clock_high(void)
+{
+    tp_line(TP_SCL, true);
+    for (unsigned i = 0; i < 1000; ++i) {
+        if (GPIOB->IDR & TP_SCL) {
+            tp_delay();
+            return true;
+        }
+    }
+    return false;
+}
+static bool tp_start(void)
+{
+    tp_line(TP_SDA, true);
+    tp_delay();
+    if (!tp_clock_high() || !(GPIOB->IDR & TP_SDA)) return false;
+    tp_line(TP_SDA, false);
+    tp_delay();
+    tp_line(TP_SCL, false);
+    return true;
+}
+static void tp_stop(void)
+{
+    tp_line(TP_SCL, false);
+    tp_line(TP_SDA, false);
+    tp_delay();
+    (void)tp_clock_high();
+    tp_line(TP_SDA, true);
+    tp_delay();
+}
+static bool tp_write(uint8_t value)
+{
+    for (unsigned i = 0; i < 8; ++i) {
+        tp_line(TP_SDA, (value & 0x80U) != 0);
+        tp_delay();
+        if (!tp_clock_high()) return false;
+        tp_line(TP_SCL, false);
+        value <<= 1;
+    }
+    tp_line(TP_SDA, true);
+    tp_delay();
+    if (!tp_clock_high()) return false;
+    bool acknowledged = (GPIOB->IDR & TP_SDA) == 0;
+    tp_line(TP_SCL, false);
+    return acknowledged;
+}
+static bool tp_read(uint8_t *value, bool acknowledge)
+{
+    uint8_t result = 0;
+    tp_line(TP_SDA, true);
+    for (unsigned i = 0; i < 8; ++i) {
+        tp_delay();
+        if (!tp_clock_high()) return false;
+        result = (uint8_t)((result << 1) | ((GPIOB->IDR & TP_SDA) != 0));
+        tp_line(TP_SCL, false);
+    }
+    tp_line(TP_SDA, !acknowledge);
+    tp_delay();
+    if (!tp_clock_high()) return false;
+    tp_line(TP_SCL, false);
+    tp_line(TP_SDA, true);
+    *value = result;
+    return true;
+}
+static bool tp_read_point(uint8_t point[5])
+{
+    bool ok = tp_start() && tp_write(TP_ADDRESS << 1) && tp_write(0x02)
+           && tp_start() && tp_write((TP_ADDRESS << 1) | 1U);
+    for (unsigned i = 0; ok && i < 5; ++i) {
+        ok = tp_read(&point[i], i < 4);
+    }
+    tp_stop();
+    return ok;
+}
+static void touch_read(lv_indev_t *input, lv_indev_data_t *data)
+{
+    (void)input;
+    static lv_point_t last_point;
+    uint8_t point[5];
+    data->state = LV_INDEV_STATE_RELEASED;
+    data->point = last_point;
+    if (!tp_read_point(point) || (point[0] & 0x0FU) == 0 || (point[1] >> 6) == 1) return;
+
+    unsigned x = ((point[1] & 0x0FU) << 8) | point[2];
+    unsigned y = ((point[3] & 0x0FU) << 8) | point[4];
+    if (x >= 240 || y >= 320) return;
+    last_point.x = x;
+    last_point.y = y;
+    data->point = last_point;
+    data->state = LV_INDEV_STATE_PRESSED;
+}
+static void touch_init(lv_display_t *display)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = TP_SCL | TP_SDA;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    tp_line(TP_SCL | TP_SDA, true);
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = TP_RST;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    pin(TP_RST, 0);
+    HAL_GPIO_Init(GPIOE, &gpio);
+    HAL_Delay(20);
+    pin(TP_RST, 1);
+    HAL_Delay(200);
+
+    lv_indev_t *input = lv_indev_create();
+    if (!input) Error_Handler();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(input, display);
+    lv_indev_set_read_cb(input, touch_read);
+}
+
 int main(void){
  HAL_Init();SystemClock_Config();__HAL_RCC_GPIOE_CLK_ENABLE();
  GPIO_InitTypeDef g={0};g.Pin=SCK|MOSI|CS|RST|DC;
@@ -98,10 +246,24 @@ int main(void){
  cmd(0x35);
  data(0x00);
  cmd(0x21);
- cmd(0x29);
  /* Explicit portrait bounds; vendor text's final address window was landscape. */
  cmd(0x36);data(0x00);cmd(0x3a);data(0x55);
- clear();for(;;)HAL_Delay(1000);
+ lv_init();
+ lv_tick_set_cb(HAL_GetTick);
+ lv_display_t *display = lv_display_create(240, 320);
+ if (!display) Error_Handler();
+ lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
+ lv_display_set_buffers(display, lcd_buffer, NULL, sizeof(lcd_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+ lv_display_set_flush_cb(display, lcd_flush);
+ touch_init(display);
+ ui_init();
+ /* Fill the panel RAM with the SquareLine screen before enabling display. */
+ lv_refr_now(display);
+ cmd(0x29);
+ for (;;) {
+    lv_timer_handler();
+    HAL_Delay(5);
+ }
 }
 void SystemClock_Config(void)
 {

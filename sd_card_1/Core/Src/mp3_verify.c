@@ -1,8 +1,9 @@
-﻿#define MINIMP3_ONLY_MP3
+#define MINIMP3_ONLY_MP3
 #define MINIMP3_NO_SIMD
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 #include "ff.h"
+#include "fat_utf8.h"
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
@@ -82,7 +83,9 @@ static int hardware_init(void)
 }
 void MP3_Verify(const char *path)
 {
- FRESULT r=f_open(&song,path,FA_READ);UINT n;DWORD offset=0;
+ static TCHAR unicode_song[512];
+ if(!fat_path_utf16(path,unicode_song,512))return;
+ FRESULT r=f_open(&song,unicode_song,FA_READ);UINT n;DWORD offset=0;
  if(r!=FR_OK){printf("[PLAY FAIL] open=%u\r\n",r);return;}
  used=pos=available=0;eof=rate=channels=failed=0;events=0;dma_error=0;
  if(f_read(&song,input,10,&n)!=FR_OK)goto finish;

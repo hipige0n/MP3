@@ -1,4 +1,4 @@
-﻿/* USER CODE BEGIN Header */
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -35,6 +35,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "fat_verify.h"
+#include "lvgl.h"
+void LCD_LVGL_Init(void);
+void RootBrowser_Process(void);
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -179,6 +182,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  LCD_LVGL_Init();
   MX_SDIO_SD_Init();         /* 只配置 SDIO 参数, 卡检测由下面的循环完成 */
   /* USER CODE BEGIN 2 */
 
@@ -205,23 +209,15 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* WK_UP: repeat the read-only FAT verification. */
-    if (HAL_GPIO_ReadPin(WKUP_GPIO_Port, WKUP_Pin) == GPIO_PIN_SET)
-    {
-      HAL_Delay(20);   /* 消抖 */
-      if (HAL_GPIO_ReadPin(WKUP_GPIO_Port, WKUP_Pin) == GPIO_PIN_SET)
-      {
-        FAT_Verify();
-        while (HAL_GPIO_ReadPin(WKUP_GPIO_Port, WKUP_Pin) == GPIO_PIN_SET);  /* 等松开 */
-      }
-    }
+    RootBrowser_Process();
+    lv_timer_handler();
 
     if ((uint32_t)(HAL_GetTick() - led_tick) >= 200U)
     {
       led_tick = HAL_GetTick();
       HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
     }
-    HAL_Delay(10);
+    HAL_Delay(5);
   }
   /* USER CODE END 3 */
 }
