@@ -28,7 +28,8 @@ static lv_obj_t *rows[PAGE_SIZE], *names[PAGE_SIZE], *status_label;
 static lv_obj_t *previous_button, *next_button;
 static unsigned page, count, seen;
 static bool pending, scanning, mounted;
-static bool play_requested;
+static bool play_requested, reopen_requested;
+static char play_directory[PATH_CAPACITY];
 static char play_path[PATH_CAPACITY];
 static lv_obj_t *browser_screen, *player_screen, *pause_button, *player_status;
 static char play_title[104];
@@ -111,6 +112,9 @@ static lv_fs_res_t font_close(lv_fs_drv_t *driver, void *file)
 static lv_fs_res_t font_read(lv_fs_drv_t *driver, void *file, void *buffer, uint32_t size, uint32_t *read)
 {
     (void)driver;
+    /* Never call the audio decoder from an IRQ or inside a FatFs operation.
+     * Each font read yields here, between completed filesystem calls. */
+    MP3_Process();
     unsigned index = font_index(file);
     FIL *stream = file;
     uint8_t *dest = buffer;
@@ -135,6 +139,7 @@ static lv_fs_res_t font_read(lv_fs_drv_t *driver, void *file, void *buffer, uint
             cached->valid_bytes = actual;
             cached->valid = true;
             ++font_misses;
+            MP3_Process();
         } else ++font_hits;
         cached->age = ++font_age;
         unsigned offset = font_position[index] % 512U;
@@ -300,16 +305,16 @@ static void entry_clicked(lv_event_t *event)
         navigation = NAV_ENTER;
         pending = true;
     } else {
-        lv_obj_set_style_text_font(status_label, font_for_text(entry->display_name), 0);
-        lv_label_set_text_fmt(status_label, "%s / %lu B", entry->display_name, (unsigned long)entry->size);
         printf("[FILE SELECT] %s size=%lu\r\n", path, (unsigned long)entry->size);
-        if (depth != 0) {
-            lv_obj_set_style_text_font(status_label, LV_FONT_DEFAULT, 0);
-            lv_label_set_text(status_label, "Test: root MP3 files only");
+        if (MP3_State()>0 && !strcmp(play_path,path)) {
+            reopen_requested=true;
             return;
         }
-        snprintf(play_path, sizeof(play_path), "%s", path);
-        name_preview(play_title, entry->display_name, 24);
+        /* Stop only when the user actually selects a different/new track. */
+        MP3_Stop();
+        snprintf(play_path,sizeof(play_path),"%s",path);
+        snprintf(play_directory,sizeof(play_directory),"%s",current_path);
+        name_preview(play_title,entry->display_name,24);
         play_requested = true;
         lv_obj_set_style_text_font(status_label, LV_FONT_DEFAULT, 0);
         lv_label_set_text(status_label, "Playing selected MP3...");
@@ -334,12 +339,11 @@ static void player_back(lv_event_t *event)
 {
     (void)event;
     switch_requested = 0;
-    MP3_Stop();
     player_visible = false;
     lv_screen_load(browser_screen);
     lv_obj_delete(player_screen);
     player_screen = NULL;
-    lv_label_set_text(status_label, "Select a root MP3");
+    lv_label_set_text(status_label, MP3_State()==1 ? "Playing > tap here for player" : MP3_State()==2 ? "Paused > tap here for player" : "Select an MP3");
 }
 static void player_pause(lv_event_t *event)
 {
@@ -381,7 +385,12 @@ static int adjacent_track(int direction)
     TCHAR lfn[256];
     TrackChoice first={0}, last={0}, previous={0}, chosen={0};
     bool found=false;
-    FRESULT result=f_opendir(&dir, (const TCHAR[]){'0',':','/',0});
+    /* Playback directory is independent of the browser navigation state. */
+    if (!fat_path_utf16(play_directory,unicode_path,512)) return 0;
+    const char *playing_alias=strrchr(play_path,'/');
+    if (!playing_alias) return 0;
+    ++playing_alias;
+    FRESULT result=f_opendir(&dir,unicode_path);
     if (result != FR_OK) return 0;
     memset(&item,0,sizeof(item));item.lfname=lfn;item.lfsize=256;
     for (;;) {
@@ -399,7 +408,7 @@ static int adjacent_track(int direction)
         if (!first.alias[0]) first=track;
         last=track;
         if (found && direction>0) { chosen=track; break; }
-        if (!strcmp(play_path+3,alias)) {
+        if (!strcmp(playing_alias,alias)) {
             found=true;
             if (direction<0 && previous.alias[0]) { chosen=previous; break; }
         }
@@ -408,7 +417,12 @@ static int adjacent_track(int direction)
     FRESULT closed=f_closedir(&dir);
     if (result != FR_OK || closed != FR_OK || !first.alias[0]) return 0;
     if (!chosen.alias[0]) chosen=direction>0 ? first : last;
-    snprintf(play_path,sizeof(play_path),"0:/%s",chosen.alias);
+    char selected_path[PATH_CAPACITY];
+    size_t path_length=strlen(play_directory);
+    int length=snprintf(selected_path,sizeof(selected_path),"%s%s%s",play_directory,
+        path_length && play_directory[path_length-1]=='/' ? "" : "/",chosen.alias);
+    if (length<0 || (unsigned)length>=sizeof(selected_path)) return 0;
+    snprintf(play_path,sizeof(play_path),"%s",selected_path);
     snprintf(play_title,sizeof(play_title),"%s",chosen.title);
     printf("[TRACK SWITCH] direction=%d path=%s\r\n",direction,play_path);
     return 1;
@@ -447,11 +461,21 @@ static void show_player(void)
     player_status = lv_label_create(player_screen);
     lv_obj_set_pos(player_status, 12, 293);
     lv_obj_set_style_text_color(player_status, lv_color_white(), 0);
-    lv_label_set_text(player_status, "Playing");
-    player_visible = true;displayed_state = 1;
+    update_player_status();
+    displayed_state=MP3_State();
+    lv_label_set_text(lv_obj_get_child(pause_button,0),displayed_state==2 ? "Play" : "Pause");
+    if (displayed_state<=0) lv_obj_add_state(pause_button,LV_STATE_DISABLED);
+    player_visible = true;
     lv_screen_load(player_screen);
     /* Render the entire page and load title glyphs before starting DMA. */
     lv_refr_now(NULL);
+}
+
+static void reopen_player(lv_event_t *event)
+{
+    (void)event;
+    if (!pending && !scanning && !play_requested && MP3_State()>0)
+        reopen_requested=true;
 }
 
 void FAT_Verify(void)
@@ -482,6 +506,8 @@ void FAT_Verify(void)
     lv_obj_set_width(status_label, 224);
     lv_label_set_long_mode(status_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(status_label, lv_color_white(), 0);
+    lv_obj_add_flag(status_label,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(status_label,reopen_player,LV_EVENT_CLICKED,NULL);
     lv_label_set_text(status_label, "Loading SD fonts...");
     lv_screen_load(screen);
     lv_refr_now(NULL);
@@ -500,6 +526,12 @@ void FAT_Verify(void)
 void RootBrowser_Process(void)
 {
     if (!mounted) return;
+    MP3_Process(); /* Audio is serviced whether the player or browser is visible. */
+    if (reopen_requested) {
+        reopen_requested=false;
+        show_player();
+        return;
+    }
     if (play_requested) {
         play_requested = false;
         show_player();
@@ -566,6 +598,7 @@ void RootBrowser_Process(void)
     for (unsigned budget = 0; budget < 32; ++budget) {
         long_name[0] = 0;
         scan_result = f_readdir(&directory, &info);
+        MP3_Process();
         if (scan_result != FR_OK || !info.fname[0]) { complete = true; break; }
         if (info.fname[0] == '.' || (info.fattrib & (AM_HID | AM_SYS))) continue;
         bool folder = (info.fattrib & AM_DIR) != 0;
@@ -605,5 +638,6 @@ void RootBrowser_Process(void)
     if (page) lv_obj_remove_state(previous_button, LV_STATE_DISABLED);
     if (seen > (page + 1) * PAGE_SIZE) lv_obj_remove_state(next_button, LV_STATE_DISABLED);
     if (!browser_font) lv_label_set_text(status_label, "Missing SD fonts; check serial");
+    else if (MP3_State()>0) lv_label_set_text_fmt(status_label,"Page %u | Player >",page+1);
     else lv_label_set_text_fmt(status_label, count ? "Page %u" : "No folders or MP3 files", page + 1);
 }

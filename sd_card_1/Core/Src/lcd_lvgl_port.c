@@ -1,3 +1,4 @@
+#include "mp3_player.h"
 /* Standalone ST7789-family SPI hello world, STM32F407 / HSE 8MHz.
  * Software SPI on PE7(SCK), PE8(SDA/MOSI), PE9(CS), PE10(RESET), PE11(RS/DC).
  * No audio/SD/TP/UART/DMA. Bare-panel power/backlight require external wiring.
@@ -69,6 +70,8 @@ static __ALIGNED(4) uint16_t lcd_buffer[240U * 10U];
 
 static void lcd_flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 {
+    /* Ten-row transfers bound LCD blocking. Service audio between chunks. */
+    MP3_Process();
     const uint16_t *rgb565 = (const uint16_t *)pixels;
     uint32_t count = (uint32_t)lv_area_get_width(area) * lv_area_get_height(area);
     window(area->x1, area->y1, area->x2, area->y2);
@@ -79,6 +82,7 @@ static void lcd_flush(lv_display_t *display, const lv_area_t *area, uint8_t *pix
         byte((uint8_t)rgb565[i]);
     }
     pin(CS, 1);
+    MP3_Process();
     lv_display_flush_ready(display);
 }
 
